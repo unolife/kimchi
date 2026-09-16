@@ -178,7 +178,10 @@ export async function openMcpPanel(
 ): Promise<void> {
 	const config = state.config
 	const cache = loadMetadataCache()
-	const provenanceMap = getServerProvenance((pi.getFlag("mcp-config") as string | undefined) ?? configOverridePath)
+	const provenanceMap = getServerProvenance(
+		(pi.getFlag("mcp-config") as string | undefined) ?? configOverridePath,
+		ctx.cwd,
+	)
 
 	const callbacks: McpPanelCallbacks = {
 		reconnect: async (serverName: string) => {
