@@ -12,8 +12,17 @@
 #   - Flag conflict crash: when an npm extension registers a flag that kimchi
 #     already provides (e.g. `--plan`), the conflict is downgraded from a hard
 #     error to a warning (kimchi built-in extensions load first and win).
+# Security (project trust): extends hasTrustRequiringProjectResources
+# (dist/core/trust-manager.js) with Kimchi's project-local .kimchi/ and
+# .claude/ resources so a cloned repo that ships them triggers the trust
+# prompt instead of being auto-trusted; the trust prompt text
+# (dist/core/project-trust.js) mentions them. Without this, an untrusted
+# repo's .kimchi/config.json (endpoint/API key), permissions, hooks, skills,
+# agents, memory, tags, and plans all take effect at startup.
 # Removal: delete each hunk once the pinned Pi release exposes equivalent APIs
-# or Kimchi no longer needs the branded behavior.
+# or Kimchi no longer needs the branded behavior. For the trust hunks: remove
+# once Pi ships native trust-scan extensibility or Kimchi adopts the
+# Pi-standard configDir layout.
 #
 diff --git a/dist/cli/args.js b/dist/cli/args.js
 index e66b528fe676bd24ee5ad95abaa6201418850678..a15fe8267bfe863a8becaadc0f894ace5db70767 100644
@@ -122,6 +131,59 @@ index ce8a9a2a613c08de483a6c94ef4f6341efff0457..a544673865fbe886ae36b03f755b16b9
                          options?.onComplete?.(result);
                      }
                      catch (error) {
+diff --git a/dist/core/extensions/loader.js b/dist/core/extensions/loader.js
+index 324d30ad5708b842f1a536f8d14950469a5ed707..4548f5931476ca51f334b29c52388ba1da1ce0af 100644
+--- a/dist/core/extensions/loader.js
++++ b/dist/core/extensions/loader.js
+@@ -29,6 +29,20 @@ import { readPiManifest } from "../pi-manifest.js";
+ import { createSyntheticSourceInfo } from "../source-info.js";
+ import { time } from "../timings.js";
+ /** Modules available to extensions via virtualModules (for compiled Bun binary) */
++// When Bun bundles the binary it renames Google GenAI's `Type` enum to `Type2`
++// (collision with typebox's `Type`). The pi-ai compat module re-exports `Type`
++// from typebox via `export { Type } from "typebox"`, but the bundled getter
++// for `.Type` references the broken `Type2` binding, producing
++// `ReferenceError: Type2 is not defined` when an extension accesses it.
++// This Proxy overrides `.Type` with the typebox namespace directly —
++// the same object pi-ai re-exports.
++const _bundledPiAiCompatSafe = new Proxy(_bundledPiAiCompat, {
++    get(target, prop, receiver) {
++        if (prop === "Type")
++            return _bundledTypebox.Type;
++        return Reflect.get(target, prop, receiver);
++    },
++});
+ const VIRTUAL_MODULES = {
+     typebox: _bundledTypebox,
+     "typebox/compile": _bundledTypeboxCompile,
+@@ -41,15 +55,23 @@ const VIRTUAL_MODULES = {
+     // Extensions resolve the pi-ai root to the compat entrypoint (a strict
+     // superset of the core entrypoint): existing extensions using the old
+     // global API keep working at runtime until compat is removed.
+-    "@earendil-works/pi-ai": _bundledPiAiCompat,
+-    "@earendil-works/pi-ai/compat": _bundledPiAiCompat,
++    //
++    // Bun's bundler renames Google GenAI's `Type` enum to `Type2` (collision
++    // with typebox's `Type`), but the renamed `Type2` binding is not
++    // accessible from the getter that `_bundledPiAiCompat.Type` triggers,
++    // producing `ReferenceError: Type2 is not defined` when an extension
++    // accesses `.Type` (e.g. `Type.Object(...)`). The Proxy intercepts `Type`
++    // and returns the typebox namespace directly — it is the same object
++    // pi-ai re-exports via `export { Type } from "typebox"`.
++    "@earendil-works/pi-ai": _bundledPiAiCompatSafe,
++    "@earendil-works/pi-ai/compat": _bundledPiAiCompatSafe,
+     "@earendil-works/pi-ai/oauth": _bundledPiAiOauth,
+     "@earendil-works/pi-ai/providers/all": _bundledPiAiProviders,
+     "@earendil-works/pi-coding-agent": _bundledPiCodingAgent,
+     "@mariozechner/pi-agent-core": _bundledPiAgentCore,
+     "@mariozechner/pi-tui": _bundledPiTui,
+-    "@mariozechner/pi-ai": _bundledPiAiCompat,
+-    "@mariozechner/pi-ai/compat": _bundledPiAiCompat,
++    "@mariozechner/pi-ai": _bundledPiAiCompatSafe,
++    "@mariozechner/pi-ai/compat": _bundledPiAiCompatSafe,
+     "@mariozechner/pi-ai/oauth": _bundledPiAiOauth,
+     "@mariozechner/pi-ai/providers/all": _bundledPiAiProviders,
+     "@mariozechner/pi-coding-agent": _bundledPiCodingAgent,
 diff --git a/dist/core/extensions/types.d.ts b/dist/core/extensions/types.d.ts
 index cb7b8e7cfb9d1fb07f4f8c3161d25927b3186e94..7ee0096f0bfc71534b34a17015525acd1bc45316 100644
 --- a/dist/core/extensions/types.d.ts
@@ -177,8 +239,73 @@ index 7d93ba62bdb5d47e129751e8075cbb34620322ad..89c8147bdfcd8ce91ea6a51ea4822c81
              .map((provider) => provider.id === "radius"
              ? provider
              : withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt));
+diff --git a/dist/core/project-trust.js b/dist/core/project-trust.js
+index c4f25095ce0f16894c2663ca435d2b608b16f6c8..5493008cfb5c0109895747323c1aeecde9d0a3d4 100644
+--- a/dist/core/project-trust.js
++++ b/dist/core/project-trust.js
+@@ -2,7 +2,9 @@ import { CONFIG_DIR_NAME } from "../config.js";
+ import { emitProjectTrustEvent } from "./extensions/runner.js";
+ import { getProjectTrustOptions, hasTrustRequiringProjectResources, } from "./trust-manager.js";
+ function formatProjectTrustPrompt(cwd) {
+-    return `Trust project folder?\n${cwd}\n\nThis allows pi to load ${CONFIG_DIR_NAME} settings and resources, install missing project packages, and execute project extensions.`;
++    // Kimchi addition: mention .kimchi/ and .claude/ alongside the config-dir
++    // resources, since the Kimchi trust scan gates those too.
++    return `Trust project folder?\n${cwd}\n\nThis allows pi to load ${CONFIG_DIR_NAME} settings and resources, Kimchi's .kimchi/ and .claude/ project resources (config, permissions, hooks, skills), install missing project packages, and execute project extensions.`;
+ }
+ async function selectProjectTrustOption(cwd, ctx) {
+     const options = getProjectTrustOptions(cwd, { includeSessionOnly: true });
+diff --git a/dist/core/resource-loader.js b/dist/core/resource-loader.js
+index 97af6cd94931d70ce7d17e02df5b6da8c61ed04c..7790a251a684779936470faa69b7d3561c066160 100644
+--- a/dist/core/resource-loader.js
++++ b/dist/core/resource-loader.js
+@@ -458,9 +458,16 @@ export class DefaultResourceLoader {
+     addExtensionConflictDiagnostics(extensionsResult) {
+         // Detect extension conflicts (tools, commands, flags with same names from different extensions)
+         // Keep all extensions loaded. Conflicts are reported as diagnostics, and precedence is handled by load order.
++        // Tool conflicts are hard errors; flag conflicts are warnings (kimchi
++        // built-in extensions load first and win at runtime).
+         const conflicts = this.detectExtensionConflicts(extensionsResult.extensions);
+         for (const conflict of conflicts) {
+-            extensionsResult.errors.push({ path: conflict.path, error: conflict.message });
++            if (conflict.severity === "warning") {
++                extensionsResult.warnings ??= [];
++                extensionsResult.warnings.push({ path: conflict.path, message: conflict.message });
++            } else {
++                extensionsResult.errors.push({ path: conflict.path, error: conflict.message });
++            }
+         }
+     }
+     mapSkillPath(resource, metadataByPath) {
+@@ -841,7 +848,7 @@ export class DefaultResourceLoader {
+         const toolOwners = new Map();
+         const flagOwners = new Map();
+         for (const ext of extensions) {
+-            // Check tools
++            // Check tools — hard errors (genuinely ambiguous at runtime)
+             for (const toolName of ext.tools.keys()) {
+                 const existingOwner = toolOwners.get(toolName);
+                 if (existingOwner && existingOwner !== ext.path) {
+@@ -854,13 +861,16 @@ export class DefaultResourceLoader {
+                     toolOwners.set(toolName, ext.path);
+                 }
+             }
+-            // Check flags
++            // Check flags — warnings only (first registration wins at runtime;
++            // kimchi built-in extensions load first, so clashes from npm
++            // extensions are benign)
+             for (const flagName of ext.flags.keys()) {
+                 const existingOwner = flagOwners.get(flagName);
+                 if (existingOwner && existingOwner !== ext.path) {
+                     conflicts.push({
+                         path: ext.path,
+-                        message: `Flag "--${flagName}" conflicts with ${existingOwner}`,
++                        severity: "warning",
++                        message: `Flag "--${flagName}" conflicts with ${existingOwner}; kimchi's registration takes precedence.`,
+                     });
+                 }
+                 else {
 diff --git a/dist/core/tools/bash.js b/dist/core/tools/bash.js
-index f274908793624a5870008ab738fa19ac6758165c..320acfb56155b8d9711b423824350b7630b8e8cb 100644
+index f274908793624a5870008ab738fa19ac6758165c..bdee7b8122c1986aa5729945f044e83c4e927323 100644
 --- a/dist/core/tools/bash.js
 +++ b/dist/core/tools/bash.js
 @@ -81,6 +81,12 @@ export function createLocalBashOperations(options) {
@@ -226,6 +353,66 @@ index 9e83601e93c81b87d52448b429f4817e6cf25bd5..a124622278d37c6372466b990a2240da
  }
  function buildEditCallComponent(component, args, theme, cwd) {
      component.setBgFn(getEditHeaderBg(component.preview, component.settledError, theme));
+diff --git a/dist/core/trust-manager.js b/dist/core/trust-manager.js
+index 17af93811e70e6276796dfb09dab263c8a04d9ce..ce5bd6f82ecac74bf1b3749b3cd1b19885c0fc25 100644
+--- a/dist/core/trust-manager.js
++++ b/dist/core/trust-manager.js
+@@ -13,6 +13,28 @@ const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES = [
+     "SYSTEM.md",
+     "APPEND_SYSTEM.md",
+ ];
++// Kimchi addition: project-local Kimchi (.kimchi/) and Claude Code (.claude/)
++// resources that the Kimchi harness reads and acts on at startup (config,
++// permissions, hooks, skills, agents, memory, tags, plans). Without this list
++// a cloned repo that ships these folders is auto-trusted and every one of them
++// takes effect without the trust prompt. Checked in cwd only, matching the
++// CONFIG_DIR_NAME check above.
++const KIMCHI_TRUST_REQUIRING_PROJECT_RESOURCES = [
++    ".kimchi/config.json",
++    ".kimchi/permissions.json",
++    ".kimchi/permissions.local.json",
++    ".kimchi/hooks",
++    ".kimchi/skills",
++    ".kimchi/agents",
++    ".kimchi/agents.json",
++    ".kimchi/agent-memory",
++    ".kimchi/agent-memory-local",
++    ".kimchi/tags.json",
++    ".kimchi/plans",
++    ".claude/skills",
++    ".claude/settings.json",
++    ".claude/settings.local.json",
++];
+ function normalizeCwd(cwd) {
+     return canonicalizePath(resolvePath(cwd));
+ }
+@@ -141,10 +163,12 @@ function withTrustFileLock(path, fn) {
+ }
+ /**
+  * Returns true when cwd has project-local resources that must be gated by
+- * project trust: trust-requiring entries under cwd/.pi, or .agents/skills in
+- * cwd or one of its ancestors. Returns false when no such project resources
+- * exist. The user/global ~/.agents/skills directory is always treated as a
+- * trusted user resource and is ignored here, even when cwd is $HOME.
++ * project trust: trust-requiring entries under cwd/.pi, Kimchi/Claude
++ * project resources in cwd (Kimchi addition, see
++ * KIMCHI_TRUST_REQUIRING_PROJECT_RESOURCES), or .agents/skills in cwd or one
++ * of its ancestors. Returns false when no such project resources exist. The
++ * user/global ~/.agents/skills directory is always treated as a trusted user
++ * resource and is ignored here, even when cwd is $HOME.
+  */
+ export function hasTrustRequiringProjectResources(cwd) {
+     const homeDir = canonicalizePath(resolvePath(process.env.HOME || homedir()));
+@@ -154,6 +178,9 @@ export function hasTrustRequiringProjectResources(cwd) {
+     if (TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES.some((entry) => existsSync(join(configDir, entry)))) {
+         return true;
+     }
++    if (KIMCHI_TRUST_REQUIRING_PROJECT_RESOURCES.some((entry) => existsSync(join(currentDir, entry)))) {
++        return true;
++    }
+     while (true) {
+         const agentsSkillsDir = join(currentDir, ".agents", "skills");
+         if (agentsSkillsDir !== userAgentsSkillsDir && existsSync(agentsSkillsDir)) {
 diff --git a/dist/modes/interactive/components/branch-summary-message.js b/dist/modes/interactive/components/branch-summary-message.js
 index e23ca6db02a29814112dd4945bd868604eb6676f..d0f6fd7aeb79c6a20655805152a30970f1b4cc2a 100644
 --- a/dist/modes/interactive/components/branch-summary-message.js
@@ -556,104 +743,3 @@ index 42e655de0fee8081a31cb588426edd30992d893c..4f33b15d036dd0f24f5e03f3712d3e9b
                  this.showStatus(`Session exported to: ${filePath}`);
              }
              else {
-diff --git a/dist/core/extensions/loader.js b/dist/core/extensions/loader.js
---- a/dist/core/extensions/loader.js
-+++ b/dist/core/extensions/loader.js
-@@ -29,6 +29,20 @@
- import { createSyntheticSourceInfo } from "../source-info.js";
- import { time } from "../timings.js";
- /** Modules available to extensions via virtualModules (for compiled Bun binary) */
-+// When Bun bundles the binary it renames Google GenAI's `Type` enum to `Type2`
-+// (collision with typebox's `Type`). The pi-ai compat module re-exports `Type`
-+// from typebox via `export { Type } from "typebox"`, but the bundled getter
-+// for `.Type` references the broken `Type2` binding, producing
-+// `ReferenceError: Type2 is not defined` when an extension accesses it.
-+// This Proxy overrides `.Type` with the typebox namespace directly —
-+// the same object pi-ai re-exports.
-+const _bundledPiAiCompatSafe = new Proxy(_bundledPiAiCompat, {
-+    get(target, prop, receiver) {
-+        if (prop === "Type")
-+            return _bundledTypebox.Type;
-+        return Reflect.get(target, prop, receiver);
-+    },
-+});
- const VIRTUAL_MODULES = {
-     typebox: _bundledTypebox,
-     "typebox/compile": _bundledTypeboxCompile,
-@@ -41,15 +55,23 @@
-     // Extensions resolve the pi-ai root to the compat entrypoint (a strict
-     // superset of the core entrypoint): existing extensions using the old
-     // global API keep working at runtime until compat is removed.
--    "@earendil-works/pi-ai": _bundledPiAiCompat,
--    "@earendil-works/pi-ai/compat": _bundledPiAiCompat,
-+    //
-+    // Bun's bundler renames Google GenAI's `Type` enum to `Type2` (collision
-+    // with typebox's `Type`), but the renamed `Type2` binding is not
-+    // accessible from the getter that `_bundledPiAiCompat.Type` triggers,
-+    // producing `ReferenceError: Type2 is not defined` when an extension
-+    // accesses `.Type` (e.g. `Type.Object(...)`). The Proxy intercepts `Type`
-+    // and returns the typebox namespace directly — it is the same object
-+    // pi-ai re-exports via `export { Type } from "typebox"`.
-+    "@earendil-works/pi-ai": _bundledPiAiCompatSafe,
-+    "@earendil-works/pi-ai/compat": _bundledPiAiCompatSafe,
-     "@earendil-works/pi-ai/oauth": _bundledPiAiOauth,
-     "@earendil-works/pi-ai/providers/all": _bundledPiAiProviders,
-     "@earendil-works/pi-coding-agent": _bundledPiCodingAgent,
-     "@mariozechner/pi-agent-core": _bundledPiAgentCore,
-     "@mariozechner/pi-tui": _bundledPiTui,
--    "@mariozechner/pi-ai": _bundledPiAiCompat,
--    "@mariozechner/pi-ai/compat": _bundledPiAiCompat,
-+    "@mariozechner/pi-ai": _bundledPiAiCompatSafe,
-+    "@mariozechner/pi-ai/compat": _bundledPiAiCompatSafe,
-     "@mariozechner/pi-ai/oauth": _bundledPiAiOauth,
-     "@mariozechner/pi-ai/providers/all": _bundledPiAiProviders,
-     "@mariozechner/pi-coding-agent": _bundledPiCodingAgent,
-diff --git a/dist/core/resource-loader.js b/dist/core/resource-loader.js
---- a/dist/core/resource-loader.js
-+++ b/dist/core/resource-loader.js
-@@ -458,9 +458,16 @@
-     addExtensionConflictDiagnostics(extensionsResult) {
-         // Detect extension conflicts (tools, commands, flags with same names from different extensions)
-         // Keep all extensions loaded. Conflicts are reported as diagnostics, and precedence is handled by load order.
-+        // Tool conflicts are hard errors; flag conflicts are warnings (kimchi
-+        // built-in extensions load first and win at runtime).
-         const conflicts = this.detectExtensionConflicts(extensionsResult.extensions);
-         for (const conflict of conflicts) {
--            extensionsResult.errors.push({ path: conflict.path, error: conflict.message });
-+            if (conflict.severity === "warning") {
-+                extensionsResult.warnings ??= [];
-+                extensionsResult.warnings.push({ path: conflict.path, message: conflict.message });
-+            } else {
-+                extensionsResult.errors.push({ path: conflict.path, error: conflict.message });
-+            }
-         }
-     }
-     mapSkillPath(resource, metadataByPath) {
-@@ -841,7 +848,7 @@
-         const toolOwners = new Map();
-         const flagOwners = new Map();
-         for (const ext of extensions) {
--            // Check tools
-+            // Check tools — hard errors (genuinely ambiguous at runtime)
-             for (const toolName of ext.tools.keys()) {
-                 const existingOwner = toolOwners.get(toolName);
-                 if (existingOwner && existingOwner !== ext.path) {
-@@ -854,13 +861,16 @@
-                     toolOwners.set(toolName, ext.path);
-                 }
-             }
--            // Check flags
-+            // Check flags — warnings only (first registration wins at runtime;
-+            // kimchi built-in extensions load first, so clashes from npm
-+            // extensions are benign)
-             for (const flagName of ext.flags.keys()) {
-                 const existingOwner = flagOwners.get(flagName);
-                 if (existingOwner && existingOwner !== ext.path) {
-                     conflicts.push({
-                         path: ext.path,
--                        message: `Flag "--${flagName}" conflicts with ${existingOwner}`,
-+                        severity: "warning",
-+                        message: `Flag "--${flagName}" conflicts with ${existingOwner}; kimchi's registration takes precedence.`,
-                     });
-                 }
-                 else {
