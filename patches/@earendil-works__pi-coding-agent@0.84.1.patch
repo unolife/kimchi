@@ -17,10 +17,14 @@
 # resources (config, permissions, hooks, skills, agents, memory, tags, plans,
 # ferments, MCP servers) so a cloned repo that ships them triggers the trust
 # prompt instead of being auto-trusted. The list is checked in cwd AND its
-# ancestors (matching the ancestor-walking skills/tags readers), with the
-# user's home excluded. The trust prompt and the untrusted warning
-# (dist/core/project-trust.js, dist/modes/interactive/interactive-mode.js)
-# mention those resources and speak as Kimchi, not pi.
+# ancestors (matching the ancestor-walking skills/tags readers), stopping at
+# the user's home (a user resource) and the OS temp directory (not a project
+# tree — a stray .kimchi/.claude created there by any tool must not gate
+# unrelated temp-dir sessions; without this, CI runners and dev machines with
+# temp-dir artifacts flag every temp cwd as trust-requiring). The trust prompt
+# and the untrusted warning (dist/core/project-trust.js,
+# dist/modes/interactive/interactive-mode.js) mention those resources and
+# speak as Kimchi, not pi.
 # Without this, an untrusted repo's .kimchi/config.json (endpoint/API key),
 # permissions, hooks (bash, kimchi-native, claude), skills, agents, memory,
 # tags, ferments, and MCP servers all take effect at startup.
@@ -361,9 +365,16 @@ index 9e83601e93c81b87d52448b429f4817e6cf25bd5..a124622278d37c6372466b990a2240da
  function buildEditCallComponent(component, args, theme, cwd) {
      component.setBgFn(getEditHeaderBg(component.preview, component.settledError, theme));
 diff --git a/dist/core/trust-manager.js b/dist/core/trust-manager.js
-index 17af93811e70e6276796dfb09dab263c8a04d9ce..0b621f8354ea4a971847be448c1fa9cee41d089e 100644
+index 17af93811e70e6276796dfb09dab263c8a04d9ce..9acc3c76215e40f5a6272f0886030818e12c99cc 100644
 --- a/dist/core/trust-manager.js
 +++ b/dist/core/trust-manager.js
+@@ -1,5 +1,5 @@
+ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+-import { homedir } from "node:os";
++import { homedir, tmpdir } from "node:os";
+ import { dirname, join } from "node:path";
+ import lockfile from "proper-lockfile";
+ import { CONFIG_DIR_NAME } from "../config.js";
 @@ -13,6 +13,35 @@ const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES = [
      "SYSTEM.md",
      "APPEND_SYSTEM.md",
@@ -400,7 +411,7 @@ index 17af93811e70e6276796dfb09dab263c8a04d9ce..0b621f8354ea4a971847be448c1fa9ce
  function normalizeCwd(cwd) {
      return canonicalizePath(resolvePath(cwd));
  }
-@@ -141,19 +170,34 @@ function withTrustFileLock(path, fn) {
+@@ -141,19 +170,42 @@ function withTrustFileLock(path, fn) {
  }
  /**
   * Returns true when cwd has project-local resources that must be gated by
@@ -426,7 +437,15 @@ index 17af93811e70e6276796dfb09dab263c8a04d9ce..0b621f8354ea4a971847be448c1fa9ce
          return true;
      }
 +    let kimchiDir = startDir;
++    // The OS temp directory is not a project tree: a stray .kimchi/ or
++    // .claude/ created there by any tool must not gate unrelated temp-dir
++    // sessions, so the walk stops at the temp root (mirroring the home
++    // exclusion above).
++    const tempRoot = canonicalizePath(resolvePath(tmpdir()));
 +    while (true) {
++        if (kimchiDir === tempRoot) {
++            break;
++        }
 +        if (kimchiDir !== homeDir &&
 +            KIMCHI_TRUST_REQUIRING_PROJECT_RESOURCES.some((entry) => existsSync(join(kimchiDir, entry)))) {
 +            return true;
