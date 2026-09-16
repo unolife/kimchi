@@ -2,6 +2,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
+import { isProjectScopeAllowed } from "../../project-scope-trust.js"
 import type { ImportKind, McpConfig, McpSettings, ServerEntry, ServerProvenance } from "./types.js"
 import { getAgentDir } from "./utils.js"
 
@@ -66,9 +67,11 @@ export function loadMcpConfig(overridePath?: string): { config: McpConfig; warni
 		}
 	}
 
-	// Check for project-local config (skip if it's the same as the main config)
+	// Check for project-local config (skip if it's the same as the main
+	// config) — gated on project trust: an untrusted repo's .kimchi/mcp.json
+	// must not register (and thereby spawn) MCP servers.
 	const projectPath = resolve(process.cwd(), PROJECT_CONFIG_NAME)
-	if (existsSync(projectPath) && projectPath !== configPath) {
+	if (existsSync(projectPath) && projectPath !== configPath && isProjectScopeAllowed(process.cwd())) {
 		try {
 			const projectConfig = JSON.parse(readFileSync(projectPath, "utf-8"))
 			const validated = validateConfig(projectConfig)
@@ -168,7 +171,10 @@ export function getServerProvenance(overridePath?: string): Map<string, ServerPr
 	}
 
 	const projectPath = resolve(process.cwd(), PROJECT_CONFIG_NAME)
-	if (existsSync(projectPath) && projectPath !== userPath) {
+	// Project MCP config is gated on project trust — the provenance map must
+	// not attribute servers to a project the user has not trusted (the /mcp UI
+	// and write flows key off this).
+	if (existsSync(projectPath) && projectPath !== userPath && isProjectScopeAllowed(process.cwd())) {
 		try {
 			const projectConfig = validateConfig(JSON.parse(readFileSync(projectPath, "utf-8")))
 			for (const name of Object.keys(projectConfig.mcpServers)) {

@@ -13,18 +13,23 @@
 #     already provides (e.g. `--plan`), the conflict is downgraded from a hard
 #     error to a warning (kimchi built-in extensions load first and win).
 # Security (project trust): extends hasTrustRequiringProjectResources
-# (dist/core/trust-manager.js) with Kimchi's project-local .kimchi/ and
-# .claude/ resources so a cloned repo that ships them triggers the trust
-# prompt instead of being auto-trusted; the trust prompt and the untrusted
-# warning (dist/core/project-trust.js, dist/modes/interactive/
-# interactive-mode.js) mention those resources and speak as Kimchi, not pi.
+# (dist/core/trust-manager.js) with Kimchi's project-local .kimchi/ and .claude/
+# resources (config, permissions, hooks, skills, agents, memory, tags, plans,
+# ferments, MCP servers) so a cloned repo that ships them triggers the trust
+# prompt instead of being auto-trusted. The list is checked in cwd AND its
+# ancestors (matching the ancestor-walking skills/tags readers), with the
+# user's home excluded. The trust prompt and the untrusted warning
+# (dist/core/project-trust.js, dist/modes/interactive/interactive-mode.js)
+# mention those resources and speak as Kimchi, not pi.
 # Without this, an untrusted repo's .kimchi/config.json (endpoint/API key),
-# permissions, hooks, skills, agents, memory, tags, and plans all take effect
-# at startup.
+# permissions, hooks (bash, kimchi-native, claude), skills, agents, memory,
+# tags, ferments, and MCP servers all take effect at startup.
 # Removal: delete each hunk once the pinned Pi release exposes equivalent APIs
 # or Kimchi no longer needs the branded behavior. For the trust hunks: remove
 # once Pi ships native trust-scan extensibility or Kimchi adopts the
-# Pi-standard configDir layout.
+# Pi-standard configDir layout. NOTE: the entry list must stay in sync with
+# TRUST_REQUIRING_PROJECT_RESOURCES in src/project-scope-trust.ts — a unit
+# test cross-checks the two.
 #
 diff --git a/dist/cli/args.js b/dist/cli/args.js
 index e66b528fe676bd24ee5ad95abaa6201418850678..a15fe8267bfe863a8becaadc0f894ace5db70767 100644
@@ -356,31 +361,38 @@ index 9e83601e93c81b87d52448b429f4817e6cf25bd5..a124622278d37c6372466b990a2240da
  function buildEditCallComponent(component, args, theme, cwd) {
      component.setBgFn(getEditHeaderBg(component.preview, component.settledError, theme));
 diff --git a/dist/core/trust-manager.js b/dist/core/trust-manager.js
-index 17af93811e70e6276796dfb09dab263c8a04d9ce..ce5bd6f82ecac74bf1b3749b3cd1b19885c0fc25 100644
+index 17af93811e70e6276796dfb09dab263c8a04d9ce..0b621f8354ea4a971847be448c1fa9cee41d089e 100644
 --- a/dist/core/trust-manager.js
 +++ b/dist/core/trust-manager.js
-@@ -13,6 +13,28 @@ const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES = [
+@@ -13,6 +13,35 @@ const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES = [
      "SYSTEM.md",
      "APPEND_SYSTEM.md",
  ];
 +// Kimchi addition: project-local Kimchi (.kimchi/) and Claude Code (.claude/)
 +// resources that the Kimchi harness reads and acts on at startup (config,
-+// permissions, hooks, skills, agents, memory, tags, plans). Without this list
-+// a cloned repo that ships these folders is auto-trusted and every one of them
-+// takes effect without the trust prompt. Checked in cwd only, matching the
-+// CONFIG_DIR_NAME check above.
++// permissions, hooks, skills, agents, memory, tags, plans, ferments, MCP
++// servers). Without this list a cloned repo that ships these folders is
++// auto-trusted and every one of them takes effect without the trust prompt.
++// Checked in cwd AND its ancestors (the skills/tags readers walk ancestors,
++// so detection must match enforcement scope); the user's home directory is
++// excluded — ~/.kimchi is a user resource, mirroring the .agents/skills home
++// exclusion below.
 +const KIMCHI_TRUST_REQUIRING_PROJECT_RESOURCES = [
 +    ".kimchi/config.json",
 +    ".kimchi/permissions.json",
 +    ".kimchi/permissions.local.json",
++    ".kimchi/hooks.json",
++    ".kimchi/hooks.local.json",
 +    ".kimchi/hooks",
 +    ".kimchi/skills",
 +    ".kimchi/agents",
 +    ".kimchi/agents.json",
 +    ".kimchi/agent-memory",
 +    ".kimchi/agent-memory-local",
++    ".kimchi/mcp.json",
 +    ".kimchi/tags.json",
 +    ".kimchi/plans",
++    ".kimchi/ferments",
 +    ".claude/skills",
 +    ".claude/settings.json",
 +    ".claude/settings.local.json",
@@ -388,7 +400,7 @@ index 17af93811e70e6276796dfb09dab263c8a04d9ce..ce5bd6f82ecac74bf1b3749b3cd1b198
  function normalizeCwd(cwd) {
      return canonicalizePath(resolvePath(cwd));
  }
-@@ -141,10 +163,12 @@ function withTrustFileLock(path, fn) {
+@@ -141,19 +170,34 @@ function withTrustFileLock(path, fn) {
  }
  /**
   * Returns true when cwd has project-local resources that must be gated by
@@ -397,7 +409,7 @@ index 17af93811e70e6276796dfb09dab263c8a04d9ce..ce5bd6f82ecac74bf1b3749b3cd1b198
 - * exist. The user/global ~/.agents/skills directory is always treated as a
 - * trusted user resource and is ignored here, even when cwd is $HOME.
 + * project trust: trust-requiring entries under cwd/.pi, Kimchi/Claude
-+ * project resources in cwd (Kimchi addition, see
++ * project resources in cwd or one of its ancestors (Kimchi addition, see
 + * KIMCHI_TRUST_REQUIRING_PROJECT_RESOURCES), or .agents/skills in cwd or one
 + * of its ancestors. Returns false when no such project resources exist. The
 + * user/global ~/.agents/skills directory is always treated as a trusted user
@@ -405,13 +417,27 @@ index 17af93811e70e6276796dfb09dab263c8a04d9ce..ce5bd6f82ecac74bf1b3749b3cd1b198
   */
  export function hasTrustRequiringProjectResources(cwd) {
      const homeDir = canonicalizePath(resolvePath(process.env.HOME || homedir()));
-@@ -154,6 +178,9 @@ export function hasTrustRequiringProjectResources(cwd) {
+     const userAgentsSkillsDir = join(homeDir, ".agents", "skills");
+-    let currentDir = canonicalizePath(resolvePath(cwd));
+-    const configDir = join(currentDir, CONFIG_DIR_NAME);
++    const startDir = canonicalizePath(resolvePath(cwd));
++    const configDir = join(startDir, CONFIG_DIR_NAME);
      if (TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES.some((entry) => existsSync(join(configDir, entry)))) {
          return true;
      }
-+    if (KIMCHI_TRUST_REQUIRING_PROJECT_RESOURCES.some((entry) => existsSync(join(currentDir, entry)))) {
-+        return true;
++    let kimchiDir = startDir;
++    while (true) {
++        if (kimchiDir !== homeDir &&
++            KIMCHI_TRUST_REQUIRING_PROJECT_RESOURCES.some((entry) => existsSync(join(kimchiDir, entry)))) {
++            return true;
++        }
++        const parentDir = dirname(kimchiDir);
++        if (parentDir === kimchiDir) {
++            break;
++        }
++        kimchiDir = parentDir;
 +    }
++    let currentDir = startDir;
      while (true) {
          const agentsSkillsDir = join(currentDir, ".agents", "skills");
          if (agentsSkillsDir !== userAgentsSkillsDir && existsSync(agentsSkillsDir)) {
