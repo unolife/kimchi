@@ -15,10 +15,12 @@
 # Security (project trust): extends hasTrustRequiringProjectResources
 # (dist/core/trust-manager.js) with Kimchi's project-local .kimchi/ and
 # .claude/ resources so a cloned repo that ships them triggers the trust
-# prompt instead of being auto-trusted; the trust prompt text
-# (dist/core/project-trust.js) mentions them. Without this, an untrusted
-# repo's .kimchi/config.json (endpoint/API key), permissions, hooks, skills,
-# agents, memory, tags, and plans all take effect at startup.
+# prompt instead of being auto-trusted; the trust prompt and the untrusted
+# warning (dist/core/project-trust.js, dist/modes/interactive/
+# interactive-mode.js) mention those resources and speak as Kimchi, not pi.
+# Without this, an untrusted repo's .kimchi/config.json (endpoint/API key),
+# permissions, hooks, skills, agents, memory, tags, and plans all take effect
+# at startup.
 # Removal: delete each hunk once the pinned Pi release exposes equivalent APIs
 # or Kimchi no longer needs the branded behavior. For the trust hunks: remove
 # once Pi ships native trust-scan extensibility or Kimchi adopts the
@@ -240,7 +242,7 @@ index 7d93ba62bdb5d47e129751e8075cbb34620322ad..89c8147bdfcd8ce91ea6a51ea4822c81
              ? provider
              : withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt));
 diff --git a/dist/core/project-trust.js b/dist/core/project-trust.js
-index c4f25095ce0f16894c2663ca435d2b608b16f6c8..5493008cfb5c0109895747323c1aeecde9d0a3d4 100644
+index c4f25095ce0f16894c2663ca435d2b608b16f6c8..b1fa4467a3f0103d5f3c95894d769cc7863029c4 100644
 --- a/dist/core/project-trust.js
 +++ b/dist/core/project-trust.js
 @@ -2,7 +2,9 @@ import { CONFIG_DIR_NAME } from "../config.js";
@@ -250,7 +252,7 @@ index c4f25095ce0f16894c2663ca435d2b608b16f6c8..5493008cfb5c0109895747323c1aeecd
 -    return `Trust project folder?\n${cwd}\n\nThis allows pi to load ${CONFIG_DIR_NAME} settings and resources, install missing project packages, and execute project extensions.`;
 +    // Kimchi addition: mention .kimchi/ and .claude/ alongside the config-dir
 +    // resources, since the Kimchi trust scan gates those too.
-+    return `Trust project folder?\n${cwd}\n\nThis allows pi to load ${CONFIG_DIR_NAME} settings and resources, Kimchi's .kimchi/ and .claude/ project resources (config, permissions, hooks, skills), install missing project packages, and execute project extensions.`;
++    return `Trust project folder?\n${cwd}\n\nThis allows Kimchi to load ${CONFIG_DIR_NAME} settings and resources, Kimchi's .kimchi/ and .claude/ project resources (config, permissions, hooks, skills), install missing project packages, and execute project extensions.`;
  }
  async function selectProjectTrustOption(cwd, ctx) {
      const options = getProjectTrustOptions(cwd, { includeSessionOnly: true });
@@ -646,7 +648,7 @@ index 2e0490362d3396995b587f502ff3e69a7cad9a43..0cb75bb6a9fd0c0a9bdb5eba7cf2eeb8
      render(width) {
          const lines = super.render(width);
 diff --git a/dist/modes/interactive/interactive-mode.js b/dist/modes/interactive/interactive-mode.js
-index 42e655de0fee8081a31cb588426edd30992d893c..4f33b15d036dd0f24f5e03f3712d3e9bec63d9e3 100644
+index 42e655de0fee8081a31cb588426edd30992d893c..86dd3c75544003363a8c6808b6a9e37833cade70 100644
 --- a/dist/modes/interactive/interactive-mode.js
 +++ b/dist/modes/interactive/interactive-mode.js
 @@ -1844,6 +1844,7 @@ export class InteractiveMode {
@@ -683,6 +685,15 @@ index 42e655de0fee8081a31cb588426edd30992d893c..4f33b15d036dd0f24f5e03f3712d3e9b
          };
      }
      /**
+@@ -3024,7 +3035,7 @@ export class InteractiveMode {
+         if (this.chatContainer.children.length > 0) {
+             this.chatContainer.addChild(new Spacer(1));
+         }
+-        this.chatContainer.addChild(new Text(theme.fg("warning", `This project is not trusted. Project ${CONFIG_DIR_NAME} resources and packages are ignored. Use /trust to save a trust decision, then restart pi.`), 1, 0));
++        this.chatContainer.addChild(new Text(theme.fg("warning", `This project is not trusted. Project ${CONFIG_DIR_NAME}, .kimchi/ and .claude/ resources and packages are ignored. Use /trust to save a trust decision, then restart Kimchi.`), 1, 0));
+     }
+     async getUserInput() {
+         const queuedInput = this.pendingUserInputs.shift();
 @@ -3815,6 +3826,33 @@ export class InteractiveMode {
              this.showModelSelector();
              return;
