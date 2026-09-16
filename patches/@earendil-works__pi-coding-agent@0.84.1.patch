@@ -1,6 +1,6 @@
 # Patch: Kimchi runtime and UI integrations for pi-coding-agent 0.84.1
 #
-# Tracking: LLM-2564. No matching upstream issue exists yet; report remaining
+# Tracking: No matching upstream issue exists yet; report remaining
 # generic changes to https://github.com/earendil-works/pi before the next upgrade.
 # Retains Kimchi CLI/provider defaults, extension-triggered prompt handling,
 # forced compaction, model selection, extension UI helpers, and compact visuals.
